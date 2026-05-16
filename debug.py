@@ -1,73 +1,94 @@
 #!/usr/bin/env python3
 import os, json, requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from google.oauth2 import service_account
 from google.auth.transport.requests import AuthorizedSession, Request as GoogleRequest
 
-GCP_SA_JSON       = os.environ["GCP_SA_JSON"]
-BILLING_ACCOUNT_ID = os.environ["BILLING_ACCOUNT_ID"]
-BUDGET_ID         = os.environ["BUDGET_ID"]
+# ── 環境変数 ────────────────────────────────────────────
+DISCORD_WEBHOOK     = os.environ["DISCORD_WEBHOOK"]
+BILLING_ACCOUNT_ID  = os.environ["BILLING_ACCOUNT_ID"]
+BUDGET_ID           = os.environ["BUDGET_ID"]
+TOTAL_CREDITS       = float(os.environ.get("TOTAL_CREDITS", "10.0"))
+ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "30"))
+GCP_SA_JSON         = os.environ["GCP_SA_JSON"]
 
-print("=== デバッグ開始 ===\n")
+STATE_FILE = Path("state.json")
 
-# 1. 認証テスト
-print("① 認証テスト...")
+# ── 認証（debug.py と同じ方法）────────────────────────
 sa_info = json.loads(GCP_SA_JSON)
-print(f"   サービスアカウント: {sa_info.get('client_email', '不明')}")
-print(f"   プロジェクトID    : {sa_info.get('project_id', '不明')}")
-
 creds = service_account.Credentials.from_service_account_info(
     sa_info,
     scopes=["https://www.googleapis.com/auth/cloud-billing.readonly"]
 )
 creds.refresh(GoogleRequest())
-print("   → 認証OK\n")
-
 session = AuthorizedSession(creds)
 
-# 2. Billing Account アクセステスト
-print("② 請求先アカウントへのアクセステスト...")
-print(f"   BILLING_ACCOUNT_ID: {BILLING_ACCOUNT_ID}")
-r = session.get(f"https://cloudbilling.googleapis.com/v1/billingAccounts/{BILLING_ACCOUNT_ID}")
-print(f"   ステータス: {r.status_code}")
-if r.status_code == 200:
-    print("   → OK")
-elif r.status_code == 403:
-    print("   → 403: 請求先アカウントへの権限がない")
-elif r.status_code == 404:
-    print("   → 404: BILLING_ACCOUNT_IDが間違っている可能性")
-else:
-    print(f"   → {r.text[:200]}")
-
-print()
-
-# 3. Budget API テスト
-print("③ バジェットAPIテスト...")
-print(f"   BUDGET_ID: {BUDGET_ID}")
+# ── バジェット取得 ──────────────────────────────────────
 url = f"https://billingbudgets.googleapis.com/v1/billingAccounts/{BILLING_ACCOUNT_ID}/budgets/{BUDGET_ID}"
-print(f"   URL: {url}")
-r2 = session.get(url)
-print(f"   ステータス: {r2.status_code}")
-if r2.status_code == 200:
-    print("   → OK")
-    print(f"   レスポンス: {r2.text[:300]}")
-else:
-    print(f"   → エラー: {r2.text[:300]}")
+r = session.get(url)
+r.raise_for_status()
+budget = r.json()
 
-# 4. バジェット一覧テスト
-print("\n④ バジェット一覧テスト（BUDGET_IDなしで全取得）...")
-url2 = f"https://billingbudgets.googleapis.com/v1/billingAccounts/{BILLING_ACCOUNT_ID}/budgets"
-r3 = session.get(url2)
-print(f"   ステータス: {r3.status_code}")
-if r3.status_code == 200:
-    data = r3.json()
-    budgets = data.get("budgets", [])
-    print(f"   バジェット数: {len(budgets)}")
-    for b in budgets:
-        name = b.get("name", "")
-        display = b.get("displayName", "")
-        print(f"   - {display}: {name}")
-        print(f"     → BUDGET_IDに使う値: {name.split('/')[-1]}")
-else:
-    print(f"   → エラー: {r3.text[:300]}")
+# ── 使用額を計算 ────────────────────────────────────────
+def parse_money(m):
+    if not m:
+        return 0.0
+    return float(m.get("units", 0)) + float(m.get("nanos", 0)) / 1_000_000_000
 
-print("\n=== デバッグ完了 ===")
+total_spent   = parse_money(budget.get("currentSpend", {}))
+remaining     = max(TOTAL_CREDITS - total_spent, 0.0)
+remaining_pct = (remaining / TOTAL_CREDITS) * 100 if TOTAL_CREDITS > 0 else 0.0
+
+# ── 今日の使用額（前回との差分）────────────────────────
+state = {}
+if STATE_FILE.exists():
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except Exception:
+        pass
+
+last_spent  = state.get("last_spent", 0.0)
+today_spent = max(total_spent - last_spent, 0.0)
+
+jst       = timezone(timedelta(hours=9))
+today_str = datetime.now(jst).strftime("%Y-%m-%d")
+date_str  = datetime.now(jst).strftime("%-m月%-d日")
+
+STATE_FILE.write_text(json.dumps({"last_spent": total_spent, "last_date": today_str}))
+
+print(f"今日の使用額: ${today_spent:.4f}")
+print(f"累計使用額  : ${total_spent:.4f}")
+print(f"残高        : ${remaining:.4f} ({remaining_pct:.1f}%)")
+
+# ── Discord に送信 ──────────────────────────────────────
+if remaining_pct <= 10:
+    color, status = 0xFF0000, "🔴 残量わずか！今すぐチャージを"
+elif remaining_pct <= ALERT_THRESHOLD_PCT:
+    color, status = 0xFF6600, "🟠 残量が少なくなっています"
+else:
+    color, status = 0x5865F2, "✅ 問題なし"
+
+bar = "█" * int(remaining_pct / 10) + "░" * (10 - int(remaining_pct / 10))
+
+payload = {
+    "embeds": [{
+        "title": "Gemini API 日次レポート",
+        "description": (
+            f"**{date_str} の API 利用まとめ**\n\n"
+            f"📅 **今日の使用額:** ${today_spent:.4f}\n"
+            f"💸 **累計使用額:** ${total_spent:.4f} / ${TOTAL_CREDITS:.2f}\n\n"
+            f"💰 **残高:** ${remaining:.4f}\n"
+            f"📊 `{bar}` {remaining_pct:.1f}%\n\n"
+            f"{status}"
+            + (f"\n\n👉 [GCPコンソールでチャージ](https://console.cloud.google.com/billing)" if remaining_pct <= ALERT_THRESHOLD_PCT else "")
+        ),
+        "color": color,
+        "footer": {"text": "自動チャージはOFF ／ 手動チャージのみ"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }]
+}
+
+res = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+res.raise_for_status()
+print("✅ Discord に送信しました")
