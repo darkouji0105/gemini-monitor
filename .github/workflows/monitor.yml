@@ -2,10 +2,7 @@ name: Gemini API 日次レポート
 
 on:
   schedule:
-    # 毎晩 21:00 JST = 12:00 UTC
     - cron: "0 12 * * *"
-
-  # Actions タブから手動実行も可能
   workflow_dispatch:
 
 jobs:
@@ -14,16 +11,13 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: リポジトリをチェックアウト
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── 前日の使用量を記録した state.json をキャッシュから復元 ──
-      - name: state.json をキャッシュから復元
+      - name: state.json キャッシュ復元
         uses: actions/cache@v4
         with:
           path: state.json
           key: gemini-state-${{ runner.os }}
-          # キャッシュがなくても失敗しない（初回は空スタート）
           restore-keys: gemini-state-
 
       - name: Python セットアップ
@@ -31,10 +25,31 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 依存ライブラリをインストール
+      - name: 依存ライブラリインストール
         run: pip install google-auth google-auth-httplib2 requests
 
-      - name: 日次レポートを実行
+      # --- 診断ステップ ここから ---
+      - name: サービスアカウント認証テスト (gcloud)
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          echo "$GCP_SA_JSON" > /tmp/sa.json
+          gcloud auth activate-service-account --key-file=/tmp/sa.json
+          gcloud auth list
+          # バジェット一覧を表示（権限確認）
+          gcloud beta billing budgets list --billing-account=${{ secrets.BILLING_ACCOUNT_ID }} || echo "バジェット一覧失敗"
+
+      - name: API 有効化確認と有効化
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          echo "$GCP_SA_JSON" > /tmp/sa.json
+          PROJECT_ID=$(jq -r .project_id /tmp/sa.json)
+          gcloud auth activate-service-account --key-file=/tmp/sa.json
+          gcloud services enable billingbudgets.googleapis.com --project=$PROJECT_ID
+      # --- 診断ステップ ここまで ---
+
+      - name: 日次レポート実行
         env:
           DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
           BILLING_ACCOUNT_ID:  ${{ secrets.BILLING_ACCOUNT_ID }}
@@ -42,12 +57,32 @@ jobs:
           GCP_SA_JSON:         ${{ secrets.GCP_SA_JSON }}
           TOTAL_CREDITS:       ${{ vars.TOTAL_CREDITS }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT }}
-        run: python debug.py
+        run: |
+          # デバッグ出力のため、一時的に debug.py を編集せずに追加のエラーハンドリング
+          python -c "
+import os, json, requests
+from google.oauth2 import service_account
+from google.auth.transport.requests import AuthorizedSession, Request
 
-      # ── 実行後の state.json をキャッシュに保存（次回の「今日の使用額」計算に使う）──
-      - name: state.json をキャッシュに保存
+sa_info = json.loads(os.environ['GCP_SA_JSON'])
+creds = service_account.Credentials.from_service_account_info(
+    sa_info, scopes=['https://www.googleapis.com/auth/cloud-billing.readonly']
+)
+creds.refresh(Request())
+session = AuthorizedSession(creds)
+
+url = f'https://billingbudgets.googleapis.com/v1/billingAccounts/{os.environ[\"BILLING_ACCOUNT_ID\"]}/budgets/{os.environ[\"BUDGET_ID\"]}'
+r = session.get(url)
+print(f'Status: {r.status_code}')
+print(f'Response: {r.text}')
+r.raise_for_status()
+"
+          # 本物の debug.py は上記診断後に戻す
+          # python debug.py
+
+      - name: state.json キャッシュ保存
         uses: actions/cache/save@v4
-        if: always()  # スクリプトが失敗しても保存を試みる
+        if: always()
         with:
           path: state.json
           key: gemini-state-${{ runner.os }}-${{ github.run_id }}
