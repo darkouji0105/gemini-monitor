@@ -42,7 +42,7 @@ jobs:
           GCP_SA_JSON:         ${{ secrets.GCP_SA_JSON }}
           TOTAL_CREDITS:       ${{ vars.TOTAL_CREDITS }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT }}
-        run: python monitor.py
+        run: python debug.py
 
       # ── 実行後の state.json をキャッシュに保存（次回の「今日の使用額」計算に使う）──
       - name: state.json をキャッシュに保存
