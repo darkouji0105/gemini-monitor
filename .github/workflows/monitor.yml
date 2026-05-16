@@ -11,9 +11,10 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - uses: actions/checkout@v4
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
 
-      - name: state.json キャッシュ復元
+      - name: state.json をキャッシュから復元
         uses: actions/cache@v4
         with:
           path: state.json
@@ -25,31 +26,62 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 依存ライブラリインストール
+      - name: 依存ライブラリをインストール
         run: pip install google-auth google-auth-httplib2 requests
 
-      # --- 診断ステップ ここから ---
-      - name: サービスアカウント認証テスト (gcloud)
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-        run: |
-          echo "$GCP_SA_JSON" > /tmp/sa.json
-          gcloud auth activate-service-account --key-file=/tmp/sa.json
-          gcloud auth list
-          # バジェット一覧を表示（権限確認）
-          gcloud beta billing budgets list --billing-account=${{ secrets.BILLING_ACCOUNT_ID }} || echo "バジェット一覧失敗"
+      # ★★★ 追加：Google Cloud 認証（公式アクションを使う）★★★
+      - name: Google Cloud 認証
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_JSON }}
 
-      - name: API 有効化確認と有効化
-        env:
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-        run: |
-          echo "$GCP_SA_JSON" > /tmp/sa.json
-          PROJECT_ID=$(jq -r .project_id /tmp/sa.json)
-          gcloud auth activate-service-account --key-file=/tmp/sa.json
-          gcloud services enable billingbudgets.googleapis.com --project=$PROJECT_ID
-      # --- 診断ステップ ここまで ---
+      # ★★★ 追加：gcloud のセットアップ（診断に必要）★★★
+      - name: gcloud をセットアップ
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ steps.auth.outputs.project_id }}
 
-      - name: 日次レポート実行
+      # ★★★ 診断1: API が有効かチェック ★★★
+      - name: API 有効化状態を確認
+        run: |
+          echo "=== 有効なAPI一覧 ==="
+          gcloud services list --enabled --filter="billingbudgets.googleapis.com"
+          if ! gcloud services list --enabled --filter="billingbudgets.googleapis.com" | grep -q billingbudgets; then
+            echo "::error::❌ Cloud Billing Budgets API が有効になっていません！"
+            echo "次のコマンドで有効化してください:"
+            echo "gcloud services enable billingbudgets.googleapis.com --project=${{ steps.auth.outputs.project_id }}"
+            exit 1
+          fi
+
+      # ★★★ 診断2: サービスアカウントが予算を取得できるか ★★★
+      - name: バジェット一覧を取得（権限テスト）
+        env:
+          BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
+        run: |
+          echo "=== バジェット一覧 ==="
+          gcloud beta billing budgets list --billing-account=$BILLING_ACCOUNT_ID
+          if [ $? -ne 0 ]; then
+            echo "::error::❌ サービスアカウントに billing.budgets.list 権限がありません"
+            echo "請求先アカウント $BILLING_ACCOUNT_ID に対して roles/billing.viewer を付与してください"
+            exit 1
+          fi
+
+      # ★★★ 診断3: 指定された BUDGET_ID が存在するか ★★★
+      - name: 特定のバジェットを取得（権限＋存在確認）
+        env:
+          BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
+          BUDGET_ID: ${{ secrets.BUDGET_ID }}
+        run: |
+          echo "=== バジェット詳細 ==="
+          gcloud beta billing budgets describe $BUDGET_ID --billing-account=$BILLING_ACCOUNT_ID
+          if [ $? -ne 0 ]; then
+            echo "::error::❌ BUDGET_ID '$BUDGET_ID' が見つからないか、アクセスできません"
+            exit 1
+          fi
+
+      # 元の Python スクリプトを実行
+      - name: 日次レポートを実行
         env:
           DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
           BILLING_ACCOUNT_ID:  ${{ secrets.BILLING_ACCOUNT_ID }}
@@ -57,30 +89,9 @@ jobs:
           GCP_SA_JSON:         ${{ secrets.GCP_SA_JSON }}
           TOTAL_CREDITS:       ${{ vars.TOTAL_CREDITS }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT }}
-        run: |
-          # デバッグ出力のため、一時的に debug.py を編集せずに追加のエラーハンドリング
-          python -c "
-import os, json, requests
-from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession, Request
+        run: python debug.py
 
-sa_info = json.loads(os.environ['GCP_SA_JSON'])
-creds = service_account.Credentials.from_service_account_info(
-    sa_info, scopes=['https://www.googleapis.com/auth/cloud-billing.readonly']
-)
-creds.refresh(Request())
-session = AuthorizedSession(creds)
-
-url = f'https://billingbudgets.googleapis.com/v1/billingAccounts/{os.environ[\"BILLING_ACCOUNT_ID\"]}/budgets/{os.environ[\"BUDGET_ID\"]}'
-r = session.get(url)
-print(f'Status: {r.status_code}')
-print(f'Response: {r.text}')
-r.raise_for_status()
-"
-          # 本物の debug.py は上記診断後に戻す
-          # python debug.py
-
-      - name: state.json キャッシュ保存
+      - name: state.json をキャッシュに保存
         uses: actions/cache/save@v4
         if: always()
         with:
