@@ -14,7 +14,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import AuthorizedSession, Request as GoogleRequest
 
 # ── 環境変数 ────────────────────────────────────────────
 DISCORD_WEBHOOK     = os.environ["DISCORD_WEBHOOK"]
@@ -32,10 +32,12 @@ STATE_FILE = Path("state.json")
 
 def get_credentials():
     sa_info = json.loads(GCP_SA_JSON)
-    return service_account.Credentials.from_service_account_info(
+    creds = service_account.Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/cloud-billing.readonly"]
     )
+    creds.refresh(GoogleRequest())
+    return creds
 
 
 def get_budget_status(credentials) -> dict:
