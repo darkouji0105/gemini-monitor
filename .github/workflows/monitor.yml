@@ -11,8 +11,7 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: リポジトリをチェックアウト
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: state.json をキャッシュから復元
         uses: actions/cache@v4
@@ -29,65 +28,49 @@ jobs:
       - name: 依存ライブラリをインストール
         run: pip install google-auth google-auth-httplib2 requests
 
-      # ★★★ 追加：Google Cloud 認証（公式アクションを使う）★★★
-      - name: Google Cloud 認証
-        id: auth
+      # ---- Google Cloud 認証（公式アクション）----
+      - id: auth
+        name: Google Cloud 認証
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_JSON }}
 
-      # ★★★ 追加：gcloud のセットアップ（診断に必要）★★★
-      - name: gcloud をセットアップ
+      - name: gcloud セットアップ
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ steps.auth.outputs.project_id }}
 
-      # ★★★ 診断1: API が有効かチェック ★★★
+      # ---- 診断1: API 有効化チェック ----
       - name: API 有効化状態を確認
         run: |
-          echo "=== 有効なAPI一覧 ==="
-          gcloud services list --enabled --filter="billingbudgets.googleapis.com"
-          if ! gcloud services list --enabled --filter="billingbudgets.googleapis.com" | grep -q billingbudgets; then
-            echo "::error::❌ Cloud Billing Budgets API が有効になっていません！"
-            echo "次のコマンドで有効化してください:"
-            echo "gcloud services enable billingbudgets.googleapis.com --project=${{ steps.auth.outputs.project_id }}"
-            exit 1
-          fi
+          gcloud services list --enabled --filter="billingbudgets.googleapis.com" | grep -q billingbudgets || \
+          ( echo "::error::❌ Cloud Billing Budgets API が無効です" && exit 1 )
 
-      # ★★★ 診断2: サービスアカウントが予算を取得できるか ★★★
+      # ---- 診断2: 権限チェック（バジェット一覧） ----
       - name: バジェット一覧を取得（権限テスト）
         env:
           BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
         run: |
-          echo "=== バジェット一覧 ==="
-          gcloud beta billing budgets list --billing-account=$BILLING_ACCOUNT_ID
-          if [ $? -ne 0 ]; then
-            echo "::error::❌ サービスアカウントに billing.budgets.list 権限がありません"
-            echo "請求先アカウント $BILLING_ACCOUNT_ID に対して roles/billing.viewer を付与してください"
-            exit 1
-          fi
+          gcloud beta billing budgets list --billing-account="$BILLING_ACCOUNT_ID" || \
+          ( echo "::error::❌ 権限不足 - roles/billing.viewer を付与してください" && exit 1 )
 
-      # ★★★ 診断3: 指定された BUDGET_ID が存在するか ★★★
-      - name: 特定のバジェットを取得（権限＋存在確認）
+      # ---- 診断3: 指定バジェットの存在確認 ----
+      - name: 特定バジェットを取得
         env:
           BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
           BUDGET_ID: ${{ secrets.BUDGET_ID }}
         run: |
-          echo "=== バジェット詳細 ==="
-          gcloud beta billing budgets describe $BUDGET_ID --billing-account=$BILLING_ACCOUNT_ID
-          if [ $? -ne 0 ]; then
-            echo "::error::❌ BUDGET_ID '$BUDGET_ID' が見つからないか、アクセスできません"
-            exit 1
-          fi
+          gcloud beta billing budgets describe "$BUDGET_ID" --billing-account="$BILLING_ACCOUNT_ID" || \
+          ( echo "::error::❌ BUDGET_ID が存在しないかアクセス不可" && exit 1 )
 
-      # 元の Python スクリプトを実行
+      # ---- 本実行 ----
       - name: 日次レポートを実行
         env:
-          DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
-          BILLING_ACCOUNT_ID:  ${{ secrets.BILLING_ACCOUNT_ID }}
-          BUDGET_ID:           ${{ secrets.BUDGET_ID }}
-          GCP_SA_JSON:         ${{ secrets.GCP_SA_JSON }}
-          TOTAL_CREDITS:       ${{ vars.TOTAL_CREDITS }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
+          BUDGET_ID: ${{ secrets.BUDGET_ID }}
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          TOTAL_CREDITS: ${{ vars.TOTAL_CREDITS }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT }}
         run: python debug.py
 
