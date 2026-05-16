@@ -26,51 +26,15 @@ jobs:
           python-version: "3.11"
 
       - name: 依存ライブラリをインストール
-        run: pip install google-auth google-auth-httplib2 requests
-
-      # ---- Google Cloud 認証（公式アクション）----
-      - id: auth
-        name: Google Cloud 認証
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_JSON }}
-
-      - name: gcloud セットアップ
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ steps.auth.outputs.project_id }}
-
-      # ---- 診断1: API 有効化チェック ----
-      - name: API 有効化状態を確認
         run: |
-          gcloud services list --enabled --filter="billingbudgets.googleapis.com" | grep -q billingbudgets || \
-          ( echo "::error::❌ Cloud Billing Budgets API が無効です" && exit 1 )
+          pip install google-auth google-auth-httplib2 requests google-cloud-monitoring
 
-      # ---- 診断2: 権限チェック（バジェット一覧） ----
-      - name: バジェット一覧を取得（権限テスト）
-        env:
-          BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
-        run: |
-          gcloud beta billing budgets list --billing-account="$BILLING_ACCOUNT_ID" || \
-          ( echo "::error::❌ 権限不足 - roles/billing.viewer を付与してください" && exit 1 )
-
-      # ---- 診断3: 指定バジェットの存在確認 ----
-      - name: 特定バジェットを取得
-        env:
-          BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
-          BUDGET_ID: ${{ secrets.BUDGET_ID }}
-        run: |
-          gcloud beta billing budgets describe "$BUDGET_ID" --billing-account="$BILLING_ACCOUNT_ID" || \
-          ( echo "::error::❌ BUDGET_ID が存在しないかアクセス不可" && exit 1 )
-
-      # ---- 本実行 ----
       - name: 日次レポートを実行
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          BILLING_ACCOUNT_ID: ${{ secrets.BILLING_ACCOUNT_ID }}
-          BUDGET_ID: ${{ secrets.BUDGET_ID }}
-          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
-          TOTAL_CREDITS: ${{ vars.TOTAL_CREDITS }}
+          DISCORD_WEBHOOK:     ${{ secrets.DISCORD_WEBHOOK }}
+          PROJECT_ID:          ${{ secrets.PROJECT_ID }}   # 追加のシークレット
+          GCP_SA_JSON:         ${{ secrets.GCP_SA_JSON }}
+          TOTAL_CREDITS:       ${{ vars.TOTAL_CREDITS }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT }}
         run: python debug.py
 
